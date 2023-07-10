@@ -13,13 +13,13 @@ repvgg_b_g4_map = {l: 4 for l in repvgg_b_group_list}
 
 
 def conv_bn(in_channels, out_channels, kernel_size, stride, padding, group=1, bias=False):
-    return nn.Sequential(
-        nn.Conv2d(
+    return nn.Sequential(OrderedDict([
+        ("conv", nn.Conv2d(
             in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
             stride=stride, padding=padding, groups=group, bias=bias
-        ),
-        nn.BatchNorm2d(num_features=out_channels)
-    )
+        )),
+        ("bn", nn.BatchNorm2d(num_features=out_channels))
+    ]))
 
 
 def add_bn_to_conv(conv, bn):
