@@ -1,16 +1,24 @@
 import os
+import time
+import timm
 import torch
 import random
 import logging
 import argparse
+import datetime
 import importlib
 import numpy as np
 
-from utils.util import *
 from thop import profile
 from model.repvgg import RepVGG
 from torch import optim as optim, nn
+from timm.utils import accuracy, AverageMeter
+from timm.scheduler import CosineLRScheduler
+from timm.loss import SoftTargetCrossEntropy
 
+def try_all_gpus():
+    devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
+    return devices if devices else [torch.device('cpu')]
 
 def set_logging(paths, time_str):
     logger = logging.getLogger(name='trainLogger')
@@ -52,7 +60,6 @@ def custom_parse():
 def build_optimizer(model, logger, lr=0.1, momentum=0.9, weight_decay=1e-4, echo=True):
     has_decay = []
     no_decay = []
-
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue  # frozen weights
@@ -71,67 +78,79 @@ def build_optimizer(model, logger, lr=0.1, momentum=0.9, weight_decay=1e-4, echo
     )
 
 
-def build_scheduler(optimizer, n_iter_per_epoch):
-    return optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=n_iter_per_epoch)
+def build_scheduler(optimizer, n_iter_per_epoch, num_epoch=120, warmup_epoch=5):
+    return CosineLRScheduler(
+        optimizer, lr_min=0, t_in_epochs=False,
+        t_initial=int(num_epoch * n_iter_per_epoch),
+        warmup_t=int(warmup_epoch * n_iter_per_epoch),
+    )
+
+@torch.no_grad()
+def validate(epoch, data_loader, model):
+    criterion = torch.nn.CrossEntropyLoss()
+    model.eval()
+
+    loss_meter = AverageMeter()
+    acc1_meter = AverageMeter()
+    acc5_meter = AverageMeter()
+
+    for idx, (images, target) in enumerate(data_loader):
+        images = images.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+        output = model(images)
+        loss = criterion(output, target)
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        loss_meter.update(loss.item(), target.size(0))
+        acc1_meter.update(acc1.item(), target.size(0))
+        acc5_meter.update(acc5.item(), target.size(0))
+    logger.info(f'[epoch {epoch + 1}] Acc@1: {acc1_meter.avg:.2f}%, Acc@5: {acc5_meter.avg:.2f}%, loss: {loss_meter.avg:.4f}')
 
 
-def train_batch(net, X, y, loss, trainer, lr_scheduler, devices):
-    if isinstance(X, list):
-        X = [x.to(devices[0]) for x in X]
-    else:
-        X = X.to(devices[0])
-    y = y.to(devices[0])
-    net.train()
-    trainer.zero_grad()
-    pred = net(X)
-    l = loss(pred, y)
-    l.sum().backward()
-    trainer.step()
-    lr_scheduler.step()
-    train_loss_sum = l.sum()
-    train_acc_sum = accuracy(pred, y)
-    return train_loss_sum, train_acc_sum
+def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler):
+    model.train()
+    optimizer.zero_grad()
+
+    num_steps = len(data_loader)
+    acc1_meter = AverageMeter()
+    acc5_meter = AverageMeter()
+
+    start = time.time()
+    for idx, (samples, targets) in enumerate(data_loader):
+        samples = samples.cuda(non_blocking=True)
+        targets = targets.cuda(non_blocking=True)
+        if mixup_fn is not None:
+            samples, targets_mixup = mixup_fn(samples, targets)
+        outputs = model(samples)
+        loss = criterion(outputs, targets_mixup)
+        acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
+        acc1_meter.update(acc1.item(), targets.size(0))
+        acc5_meter.update(acc5.item(), targets.size(0))
+        optimizer.zero_grad()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters=model.parameters(), max_norm=20, norm_type=2, error_if_nonfinite=True)
+        optimizer.step()
+        lr_scheduler.step_update(epoch * num_steps + idx)
+
+        if idx % (num_steps // 5) == 0 or idx == num_steps - 1:
+            lr = optimizer.param_groups[0]['lr']
+            logger.info(
+                f'epoch: {epoch + 1}/{config["epoch"]}, batch: {idx + 1}/{num_steps}, lr: {lr:.4f}, ' +
+                f'loss {loss.item():.4f}, grad_norm {grad_norm:.2f}, Acc@1: {acc1_meter.avg:.2f}%, Acc@5: {acc5_meter.avg:.2f}%')
+
+    epoch_time = time.time() - start
+    logger.info(f"EPOCH {epoch + 1} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
 
-def evaluate_train_accuracy(net, data_iter, device=None):
-    if isinstance(net, nn.Module):
-        net.eval()  # Set the model to evaluation mode
-        if not device:
-            device = next(iter(net.parameters())).device
-    metric = Accumulator(2)
-
-    with torch.no_grad():
-        for X, y in data_iter:
-            if isinstance(X, list):
-                # Required for BERT Fine-tuning (to be covered later)
-                X = [x.to(device) for x in X]
-            else:
-                X = X.to(device)
-            y = y.to(device)
-            metric.add(top1_acc(net(X), y), y.numel())
-    return metric[0] / metric[1]
-
-
-def train(net, train_iter, test_iter, num_epochs, optimizer, lr_scheduler, criterion, devices=try_all_gpus()):
-    timer, num_batches = Timer(), len(train_iter)
-    animator = Animator(
-        xlabel='epoch', xlim=[1, num_epochs], ylim=[0, 1], legend=['train loss', 'train acc', 'test acc'])
-    net = nn.DataParallel(net, device_ids=devices).to(devices[0])
-    for epoch in range(num_epochs):
-        metric = Accumulator(4)
-        for i, (features, labels) in enumerate(train_iter):
-            timer.start()
-            l, acc = train_batch(net, features, labels, criterion, optimizer, lr_scheduler, devices)
-            metric.add(l, acc, labels.shape[0], labels.numel())
-            timer.stop()
-            if (i + 1) % (num_batches // 5) == 0 or i == num_batches - 1:
-                animator.add(
-                    epoch + (i + 1) / num_batches, (metric[0] / metric[2], metric[1] / metric[3], None)
-                )
-        test_acc = evaluate_train_accuracy(net, test_iter)
-        animator.add(epoch + 1, (None, None, test_acc))
-    print(f'loss {metric[0] / metric[2]:.3f}, train acc {metric[1] / metric[3]:.3f}, test acc {test_acc:.3f}')
-    print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec on {str(devices)}')
+def train(model, logger, train_iter, test_iter, optimizer, lr_scheduler, criterion, train_config, mixup_fn):
+    logger.info("Start training")
+    start_time = time.time()
+    for epoch in range(train_config["epoch"]):
+        train_one_epoch(train_config, model, criterion, train_iter, optimizer, epoch, mixup_fn, lr_scheduler)
+        validate(epoch, test_iter, model)
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    logger.info('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':
@@ -141,10 +160,10 @@ if __name__ == '__main__':
     logger = set_logging(args.out_dir, time_str)
     setup_seed(args.seed)
     logger.info(f"Random Seed: {args.seed}")
-    DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-    logger.info(f"device in: {DEVICE}")
+    devices = try_all_gpus()
+    logger.info(f"device in: {devices}")
     train_config = importlib.import_module(args.train_config).train_config
-    logger.info(f"utils config: \n{train_config}")
+    logger.info(f"train config: \n{train_config}")
     module_config = importlib.import_module(args.module_config).module_config
     logger.info(f"module config: \n{module_config}")
 
@@ -152,8 +171,8 @@ if __name__ == '__main__':
     if train_config["DATASET"] == "cifar100":
         from data.cifar100 import build_loader
 
-        dataset_train, dataset_val, data_loader_train, data_loader_val, module_config["num_classes"] = \
-            build_loader(train_config["BATCH_SIZE"], train_config["NUM_WORKERS"])
+        dataset_train, dataset_val, data_loader_train, data_loader_val, module_config["num_classes"], mixup_fn = \
+            build_loader(train_config["BATCH_SIZE"], train_config["NUM_WORKERS"], train_config["mixup_args"])
     logger.info(f"Lording Dataset {train_config['DATASET']} successfully")
 
     if not module_config["plus"]:
@@ -162,21 +181,21 @@ if __name__ == '__main__':
             in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
             groups=module_config["groups"]
         )
+        flops, params = profile(model, inputs=(torch.randn(1, 3, 224, 224),))
+        logger.info(f"params: {params / 1e6:.2f}M, FLOPs: {flops / 1e9:.2f}B (in Tensor(1, 3, 224, 224))")
+        model = nn.DataParallel(model, device_ids=devices).to(devices[0])
         logger.info(f"module structure : \n{model}")
 
     optimizer = build_optimizer(
         model, logger, lr=train_config['lr'],
         momentum=train_config['momentum'], weight_decay=train_config["weight_decay"]
     )
-    model.cuda()
+    lr_scheduler = build_scheduler(optimizer, len(data_loader_train), train_config["epoch"], train_config["warmup"])
+    criterion = SoftTargetCrossEntropy()
 
-    lr_scheduler = build_scheduler(optimizer, len(data_loader_train) * train_config["epoch"])
-
-    # flops, params = profile(model, inputs=(torch.randn(1, 3, 224, 224).to(DEVICE),))
-    # logger.info(f"params: {params / 1e6:.2f}M, FLOPs: {flops / 1e9:.2f}B (in Tensor(1, 3, 224, 224))")
-    criterion = torch.nn.CrossEntropyLoss()
     train(
-        model, data_loader_train, data_loader_val, train_config["epoch"], optimizer, lr_scheduler, criterion
+        model, logger, data_loader_train, data_loader_val, optimizer, lr_scheduler, criterion, train_config, mixup_fn)
+    torch.save(
+        {'model': model.state_dict()},
+        os.path.join(args.out_dir, f"{args.module_config.split('.')[-1]}_{time_str}.pth")
     )
-    torch.save({'model': model.state_dict()},
-               os.path.join(args.out_dir, f"{args.module_config.split('.')[-1]}_{time_str}".pth))
