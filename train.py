@@ -16,9 +16,11 @@ from timm.utils import accuracy, AverageMeter
 from timm.scheduler import CosineLRScheduler
 from timm.loss import SoftTargetCrossEntropy
 
+
 def try_all_gpus():
     devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
     return devices if devices else [torch.device('cpu')]
+
 
 def set_logging(paths, time_str):
     logger = logging.getLogger(name='trainLogger')
@@ -85,6 +87,7 @@ def build_scheduler(optimizer, n_iter_per_epoch, num_epoch=120, warmup_epoch=5):
         warmup_t=int(warmup_epoch * n_iter_per_epoch),
     )
 
+
 @torch.no_grad()
 def validate(epoch, data_loader, model):
     criterion = torch.nn.CrossEntropyLoss()
@@ -103,8 +106,30 @@ def validate(epoch, data_loader, model):
         loss_meter.update(loss.item(), target.size(0))
         acc1_meter.update(acc1.item(), target.size(0))
         acc5_meter.update(acc5.item(), target.size(0))
-    logger.info(f'[epoch {epoch + 1}] Acc@1: {acc1_meter.avg:.2f}%, Acc@5: {acc5_meter.avg:.2f}%, loss: {loss_meter.avg:.4f}')
+    logger.info(
+        f'[epoch {epoch + 1}] Acc@1: {acc1_meter.avg:.2f}%, Acc@5: {acc5_meter.avg:.2f}%, loss: {loss_meter.avg:.4f}')
+    return acc1_meter.avg, acc5_meter.avg
 
+@torch.no_grad()
+def test(data_loader, model):
+    model.eval()
+    test_len = len(data_loader)
+    acc1_meter = AverageMeter()
+    acc5_meter = AverageMeter()
+    start_time = None
+    for idx, (images, target) in enumerate(data_loader):
+        if id >= test_len // 2 and start_time == None:
+            start = time.time()
+        images = images.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+        output = model(images)
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1_meter.update(acc1.item(), target.size(0))
+        acc5_meter.update(acc5.item(), target.size(0))
+    end = time.time()
+    datetime.timedelta(seconds=int(end - start))
+    logger.info(f'Acc@1: {acc1_meter.avg:.2f}%, Acc@5: {acc5_meter.avg:.2f}%, ' +
+                f'Speed: {(end - start) / test_len - test_len // 2}')
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler):
     model.train()
@@ -145,9 +170,17 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
 def train(model, logger, train_iter, test_iter, optimizer, lr_scheduler, criterion, train_config, mixup_fn):
     logger.info("Start training")
     start_time = time.time()
+    best_acc1 = 0
     for epoch in range(train_config["epoch"]):
         train_one_epoch(train_config, model, criterion, train_iter, optimizer, epoch, mixup_fn, lr_scheduler)
-        validate(epoch, test_iter, model)
+        acc1, acc5 = validate(epoch, test_iter, model)
+        if epoch % (train_config["epoch"] // 5) == 0 or epoch >= int(train_config["epoch"] * 0.9):
+            if acc1 >= best_acc1:
+                torch.save(
+                    {'model': model.state_dict()},
+                    os.path.join(args.out_dir, f"{args.module_config.split('.')[-1]}_{time_str}_epoch{epoch + 1}.pth")
+                )
+                best_acc1 = max(best_acc1, acc1)
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     logger.info('Training time {}'.format(total_time_str))
@@ -175,17 +208,20 @@ if __name__ == '__main__':
             build_loader(train_config["BATCH_SIZE"], train_config["NUM_WORKERS"], train_config["mixup_args"])
     logger.info(f"Lording Dataset {train_config['DATASET']} successfully")
 
-    if not module_config["plus"]:
+    if module_config["mask"] == "repvgg":
         model = RepVGG(
             a=module_config["a"], b=module_config["b"], depths=module_config["depths"],
             in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
             groups=module_config["groups"]
         )
-        flops, params = profile(model, inputs=(torch.randn(1, 3, 224, 224),))
-        logger.info(f"params: {params / 1e6:.2f}M, FLOPs: {flops / 1e9:.2f}B (in Tensor(1, 3, 224, 224))")
-        model = nn.DataParallel(model, device_ids=devices).to(devices[0])
-        logger.info(f"module structure : \n{model}")
-
+    elif module_config["mask"] == "repvgg+":
+        pass
+    else:
+        model = timm.create_model(module_config["mask"], pretrained=False, num_classes=module_config["num_classes"])
+    flops, params = profile(model, inputs=(torch.randn(1, 3, 224, 224),))
+    logger.info(f"params: {params / 1e6:.2f}M, FLOPs: {flops / 1e9:.2f}B (in Tensor(1, 3, 224, 224))")
+    model = nn.DataParallel(model, device_ids=devices).to(devices[0])
+    logger.info(f"module structure : \n{model}")
     optimizer = build_optimizer(
         model, logger, lr=train_config['lr'],
         momentum=train_config['momentum'], weight_decay=train_config["weight_decay"]
@@ -197,5 +233,5 @@ if __name__ == '__main__':
         model, logger, data_loader_train, data_loader_val, optimizer, lr_scheduler, criterion, train_config, mixup_fn)
     torch.save(
         {'model': model.state_dict()},
-        os.path.join(args.out_dir, f"{args.module_config.split('.')[-1]}_{time_str}.pth")
+        os.path.join(args.out_dir, f"{args.module_config.split('.')[-1]}_{time_str}_last.pth")
     )

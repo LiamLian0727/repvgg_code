@@ -1,7 +1,7 @@
 module_config = {
-    "a": 0.75,
+    "a": 1,
     "b": 2.5,
-    "depths": [1, 2, 4, 14, 1],
+    "depths": [1, 4, 6, 16, 1],
     "in_channels": 3,
     "num_classes": 100,
     "groups": dict(),

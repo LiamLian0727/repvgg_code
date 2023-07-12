@@ -4,9 +4,10 @@ from timm.data.mixup import Mixup
 from torchtoolbox.transform import Cutout
 from torchvision import datasets, transforms
 
+PATH = "data/cifar"
 
 
-def build_loader(batch_size, num_workers, mixup_args, path="data/cifar"):
+def build_loader(batch_size, num_workers, mixup_args, path=PATH):
     dataset_train, num_classes = build_dataset(is_train=True, path=path)
     dataset_val, _ = build_dataset(is_train=False, path=path)
     data_loader_train = torch.utils.data.DataLoader(
