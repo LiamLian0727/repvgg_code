@@ -10,7 +10,6 @@ import importlib
 import numpy as np
 
 from thop import profile
-from model.repvgg import RepVGG
 from torch import optim as optim, nn
 from timm.utils import accuracy, AverageMeter
 from timm.scheduler import CosineLRScheduler
@@ -110,6 +109,7 @@ def validate(epoch, data_loader, model):
         f'[epoch {epoch + 1}] Acc@1: {acc1_meter.avg:.2f}%, Acc@5: {acc5_meter.avg:.2f}%, loss: {loss_meter.avg:.4f}')
     return acc1_meter.avg, acc5_meter.avg
 
+
 @torch.no_grad()
 def test(data_loader, model):
     model.eval()
@@ -131,6 +131,7 @@ def test(data_loader, model):
     logger.info(f'Acc@1: {acc1_meter.avg:.2f}%, Acc@5: {acc5_meter.avg:.2f}%, ' +
                 f'Speed: {(end - start) / test_len - test_len // 2}')
 
+
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler):
     model.train()
     optimizer.zero_grad()
@@ -146,7 +147,11 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         if mixup_fn is not None:
             samples, targets_mixup = mixup_fn(samples, targets)
         outputs = model(samples)
-        loss = criterion(outputs, targets_mixup)
+        if type(outputs) is dict:
+            loss = criterion(outputs["out"], targets_mixup) + 0.15 * criterion(outputs["aux1"], targets_mixup) + \
+                   0.33 * criterion(outputs["aux2"], targets_mixup) + 0.66 * criterion(outputs["aux1"], targets_mixup)
+        else:
+            loss = criterion(outputs, targets_mixup)
         acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
         acc1_meter.update(acc1.item(), targets.size(0))
         acc5_meter.update(acc5.item(), targets.size(0))
@@ -209,13 +214,21 @@ if __name__ == '__main__':
     logger.info(f"Lording Dataset {train_config['DATASET']} successfully")
 
     if module_config["mask"] == "repvgg":
+        from model.repvgg import RepVGG
+
         model = RepVGG(
             a=module_config["a"], b=module_config["b"], depths=module_config["depths"],
             in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
             groups=module_config["groups"]
         )
     elif module_config["mask"] == "repvgg+":
-        pass
+        from model.repvgg_plus import RepVGGplus
+
+        model = RepVGGplus(
+            a=module_config["a"], b=module_config["b"], depths=module_config["depths"],
+            in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
+            groups=module_config["groups"]
+        )
     else:
         model = timm.create_model(module_config["mask"], pretrained=False, num_classes=module_config["num_classes"])
     flops, params = profile(model, inputs=(torch.randn(1, 3, 224, 224),))

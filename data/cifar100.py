@@ -1,4 +1,5 @@
 import torch
+from torch.utils.data import DataLoader
 
 from timm.data.mixup import Mixup
 from torchtoolbox.transform import Cutout
@@ -10,11 +11,12 @@ PATH = "data/cifar"
 def build_loader(batch_size, num_workers, mixup_args, path=PATH):
     dataset_train, num_classes = build_dataset(is_train=True, path=path)
     dataset_val, _ = build_dataset(is_train=False, path=path)
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True,
+
+    data_loader_train = DataLoader(
+        dataset_train, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True, pin_memory=True
     )
-    data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False
+    data_loader_val = DataLoader(
+        dataset_val, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=False, pin_memory=True
     )
     return dataset_train, dataset_val, data_loader_train, data_loader_val, num_classes, Mixup(**mixup_args)
 
