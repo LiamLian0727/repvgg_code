@@ -5,14 +5,16 @@ import torch.nn.functional as F
 from collections import OrderedDict
 
 
-def conv_bn(in_channels, out_channels, kernel_size, stride, padding, group=1, bias=False):
-    return nn.Sequential(OrderedDict([
-        ("conv", nn.Conv2d(
-            in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-            stride=stride, padding=padding, groups=group, bias=bias
-        )),
-        ("bn", nn.BatchNorm2d(num_features=out_channels))
-    ]))
+def conv_bn(in_channels, out_channels, kernel_size, stride, padding, group=1, bias=False, relu=False):
+    conv_block = nn.Sequential()
+    conv_block.add_module("conv", nn.Conv2d(
+        in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
+        stride=stride, padding=padding, groups=group, bias=bias
+    ))
+    conv_block.add_module("bn", nn.BatchNorm2d(num_features=out_channels))
+    if relu:
+        conv_block.add_module("relu", nn.ReLU(inplace=True))
+    return conv_block
 
 
 def add_bn_to_conv(conv, bn):
@@ -28,7 +30,7 @@ def add_bn_to_conv(conv, bn):
 
 
 class RepVGGBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, group=1):
+    def __init__(self, in_channels, out_channels, stride=1, group=1, add_conv=0):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -36,6 +38,11 @@ class RepVGGBlock(nn.Module):
         self.conv3x3 = conv_bn(
             in_channels, out_channels, kernel_size=3, padding=1, stride=stride, group=group
         )
+        self.add_conv = nn.ModuleList([
+            conv_bn(
+                in_channels, out_channels, kernel_size=3, padding=1, stride=stride, group=group, relu=True
+            ) for _ in range(add_conv)
+        ])
         self.conv1x1 = conv_bn(
             in_channels, out_channels, kernel_size=1, padding=0, stride=stride, group=group
         )
@@ -43,10 +50,17 @@ class RepVGGBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        return self.relu(self.conv3x3(x) + self.conv1x1(x) + (self.identity(x) if self.identity else 0))
+        sum_3x3 = self.conv3x3(x)
+        for conv in self.add_conv:
+            sum_3x3 += conv(x)
+        return self.relu(sum_3x3 + self.conv1x1(x) + (self.identity(x) if self.identity else 0))
 
     def fused_block_to_conv(self):
         conv_3x3_weight = add_bn_to_conv(conv=self.conv3x3[0], bn=self.conv3x3[1])
+        for conv_layer in self.add_conv:
+            add_conv_weight = add_bn_to_conv(conv=conv_layer[0], bn=conv_layer[1])
+            conv_3x3_weight["weight"] += add_conv_weight["weight"]
+            conv_3x3_weight["bias"] += add_conv_weight["bias"]
         if self.conv1x1:
             conv_1x1_weight = add_bn_to_conv(conv=self.conv1x1[0], bn=self.conv1x1[1])
             conv_1x1_weight["weight"] = F.pad(conv_1x1_weight["weight"], [1, 1, 1, 1])
@@ -85,24 +99,24 @@ class RepVGGFastBlock(nn.Sequential):
 
 
 class RepVGGplus(nn.Module):
-    def __init__(self, a=1, b=2.5, depths=[1, 2, 4, 14, 1], in_channels=3, num_classes=10, groups=dict()):
+    def __init__(self, a=1, b=2.5, depths=[1, 2, 4, 14, 1], in_channels=3, add_conv=0, num_classes=10, groups=dict()):
         super().__init__()
         self.idx = 0
         self.groups = groups
         self.num_classes = num_classes
         self.stages = nn.Sequential(OrderedDict([
-            ("stage0", self.make_stage(in_channels, min(64, int(64 * a)), depth=depths[0])),
-            ("stage1", self.make_stage(min(64, int(64 * a)), int(64 * a), depth=depths[1])),
-            ("stage2", self.make_stage(int(64 * a), int(128 * a), depth=depths[2])),
-            ("stage3_1", self.make_stage(int(128 * a), int(256 * a), depth=depths[3] // 2)),
-            ("stage3_2", self.make_stage(int(128 * a), int(256 * a), depth=depths[3] - depths[3] // 2)),
+            ("stage0", self.make_stage(in_channels, min(64, int(64 * a)), depth=depths[0], add_conv=add_conv * 2)),
+            ("stage1", self.make_stage(min(64, int(64 * a)), int(64 * a), depth=depths[1], add_conv=add_conv * 2)),
+            ("stage2", self.make_stage(int(64 * a), int(128 * a), depth=depths[2], add_conv=add_conv)),
+            ("stage3_1", self.make_stage(int(128 * a), int(256 * a), depth=depths[3] // 2, add_conv=add_conv)),
+            ("stage3_2", self.make_stage(int(256 * a), int(256 * a), depth=depths[3] - depths[3] // 2, add_conv=add_conv)),
             ("stage4", self.make_stage(int(256 * a), int(512 * b), depth=depths[4])),
         ]))
 
         self.aux_out = nn.Sequential(OrderedDict([
-            ("stage1", self.mask_out(int(64 * a), int(128 * b))),
-            ("stage2", self.mask_out(int(128 * a), int(256 * b))),
-            ("stage3_1", self.mask_out(int(128 * a), int(256 * b)))
+            ("stage1", self.mask_out(int(64 * a), int(64 * a))),
+            ("stage2", self.mask_out(int(128 * a), int(128 * a))),
+            ("stage3_1", self.mask_out(int(256 * a), int(256 * a)))
         ]))
 
         self.avg_pool = nn.AdaptiveAvgPool2d(output_size=1)
@@ -110,19 +124,23 @@ class RepVGGplus(nn.Module):
         self._initialize_weights()
 
     def mask_out(self, in_channels, out_channels):
-        stage = self.make_stage(in_channels, out_channels, 1)
+        stage = nn.Sequential()
+        stage.add_module("conv", nn.Conv2d(
+            in_channels=in_channels, out_channels=out_channels, kernel_size=3, stride=1, padding=2
+        ))
         stage.add_module("avg_poll", nn.AdaptiveAvgPool2d(output_size=1))
+        stage.add_module("flatten", nn.Flatten())
         stage.add_module("out_linee", nn.Linear(out_channels, self.num_classes))
         return stage
 
-    def make_stage(self, in_channels, out_channels, depth):
+    def make_stage(self, in_channels, out_channels, depth, add_conv=0):
         stage = nn.Sequential()
         for i in range(depth):
             stage.add_module(
                 f"layer {self.idx}",
                 RepVGGBlock(
                     in_channels if i == 0 else out_channels, out_channels,
-                    stride=2 if i == 0 else 1, group=self.groups.get(self.idx, 1)
+                    stride=2 if i == 0 else 1, group=self.groups.get(self.idx, 1), add_conv=add_conv
                 )
             )
             self.idx += 1
@@ -132,7 +150,7 @@ class RepVGGplus(nn.Module):
         res = {}
         for idx, stage in enumerate(self.stages):
             x = stage(x)
-            if idx in [1, 2, 3]:
+            if idx in [1, 2, 3] and hasattr(self, "aux_out"):
                 res[f"aux{idx}"] = self.aux_out[idx - 1](x)
         x = self.avg_pool(x)
         x = x.view(x.size(0), -1)

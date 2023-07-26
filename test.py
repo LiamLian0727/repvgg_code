@@ -13,8 +13,6 @@ from thop import profile
 from timm.utils import AverageMeter, accuracy
 from torch import nn
 
-from model.repvgg import RepVGG
-
 
 def try_all_gpus():
     devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
@@ -50,17 +48,19 @@ def test(data_loader, model):
     acc1_meter = AverageMeter()
     acc5_meter = AverageMeter()
     items = AverageMeter()
-    start_time = None
+    start = None
     for idx, (images, target) in enumerate(data_loader):
-        if idx >= test_len // 2 and start_time == None:
+        if idx >= test_len // 2 and start == None:
             start = time.time()
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         output = model(images)
+        if type(output) is dict:
+            output = output["out"]
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         acc1_meter.update(acc1.item(), target.size(0))
         acc5_meter.update(acc5.item(), target.size(0))
-        if start_time != None:
+        if start != None:
             items.update(target.size(0))
     end = time.time()
     datetime.timedelta(seconds=int(end - start))
@@ -87,12 +87,23 @@ if __name__ == '__main__':
             shuffle=False, num_workers=train_config["NUM_WORKERS"], drop_last=False)
     logger.info(f"Lording Dataset {train_config['DATASET']} successfully")
 
-    if module_config["mask"] == "repvgg":
-        model = RepVGG(
-            a=module_config["a"], b=module_config["b"], depths=module_config["depths"],
-            in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
-            groups=module_config["groups"]
-        )
+    if "repvgg" in module_config["mask"]:
+        if module_config["mask"] == "repvgg":
+            from model.repvgg import RepVGG
+
+            model = RepVGG(
+                a=module_config["a"], b=module_config["b"], depths=module_config["depths"],
+                in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
+                groups=module_config["groups"]
+            )
+        elif module_config["mask"] == "repvgg+":
+            from model.repvgg_plus import RepVGGplus
+
+            model = RepVGGplus(
+                a=module_config["a"], b=module_config["b"], depths=module_config["depths"],
+                in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
+                groups=module_config["groups"], add_conv=module_config.get("add_conv", 0)
+            )
         model_test = copy.deepcopy(model)
         model_test.switch_to_fast()
         flops, params = profile(model, inputs=(torch.randn(1, 3, 224, 224),))
@@ -106,7 +117,10 @@ if __name__ == '__main__':
         logger.info(f"params: {params / 1e6:.2f}M, FLOPs: {flops / 1e9:.2f}B (in Tensor(1, 3, 224, 224))")
         model.module.switch_to_fast()
         test(data_loader=data_loader_val, model=model)
-    elif module_config["mask"] == "repvgg+":
-        pass
     else:
         model = timm.create_model(module_config["mask"], pretrained=False, num_classes=module_config["num_classes"])
+        flops, params = profile(model, inputs=(torch.randn(1, 3, 224, 224),))
+        logger.info(f"params: {params / 1e6:.2f}M, FLOPs: {flops / 1e9:.2f}B (in Tensor(1, 3, 224, 224))")
+        model = nn.DataParallel(model, device_ids=devices).to(devices[0])
+        model.load_state_dict(torch.load(args.pth_file)['model'])
+        test(data_loader=data_loader_val, model=model)

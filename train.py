@@ -100,7 +100,14 @@ def validate(epoch, data_loader, model):
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         output = model(images)
-        loss = criterion(output, target)
+
+        if type(output) is dict:
+            loss = criterion(output["out"], target) + 0.15 * criterion(output["aux1"], target) + \
+                   0.33 * criterion(output["aux2"], target) + 0.66 * criterion(output["aux1"], target)
+            output = output["out"]
+        else:
+            loss = criterion(output, target)
+
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         loss_meter.update(loss.item(), target.size(0))
         acc1_meter.update(acc1.item(), target.size(0))
@@ -123,6 +130,8 @@ def test(data_loader, model):
         images = images.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         output = model(images)
+        if type(output) is dict:
+            output = output["out"]
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
         acc1_meter.update(acc1.item(), target.size(0))
         acc5_meter.update(acc5.item(), target.size(0))
@@ -149,7 +158,8 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
         outputs = model(samples)
         if type(outputs) is dict:
             loss = criterion(outputs["out"], targets_mixup) + 0.15 * criterion(outputs["aux1"], targets_mixup) + \
-                   0.33 * criterion(outputs["aux2"], targets_mixup) + 0.66 * criterion(outputs["aux1"], targets_mixup)
+                   0.15 * criterion(outputs["aux2"], targets_mixup) + 0.15 * criterion(outputs["aux1"], targets_mixup)
+            outputs = outputs["out"]
         else:
             loss = criterion(outputs, targets_mixup)
         acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
@@ -227,7 +237,7 @@ if __name__ == '__main__':
         model = RepVGGplus(
             a=module_config["a"], b=module_config["b"], depths=module_config["depths"],
             in_channels=module_config["in_channels"], num_classes=module_config["num_classes"],
-            groups=module_config["groups"]
+            groups=module_config["groups"], add_conv=module_config.get("add_conv", 0)
         )
     else:
         model = timm.create_model(module_config["mask"], pretrained=False, num_classes=module_config["num_classes"])
