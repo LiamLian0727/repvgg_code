@@ -7,7 +7,7 @@
 2023年7月28日
 
 ### Training
-`python tools/train.py -t config.TrainConfig -m config.RepVGG_A0 -o work_path
+`python tools/train.py -t config.TrainConfig -m config.RepVGG_A0 -o work_path`
 
 ### Test
-`python tools/test.py -t config.TrainConfig -m config.RepVGG_A0 -p pth_path
+`python tools/test.py -t config.TrainConfig -m config.RepVGG_A0 -p pth_path`
