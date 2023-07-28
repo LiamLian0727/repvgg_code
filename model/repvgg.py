@@ -18,7 +18,7 @@ def conv_bn(in_channels, out_channels, kernel_size, stride, padding, group=1, bi
 
 def add_bn_to_conv(conv, bn):
     # bn(M x W; u; a; y; b) = y * [(M x W - u) / a] + b
-    # u 均值, a 方差, y 缩放系数, b 偏置, W 卷积核, 'x' 卷积操作
+    # u 均值, a 标准差, y 缩放系数, b 偏置, W 卷积核, 'x' 卷积操作
     # bn(M x W; u; a; y; b) 等价于 M x W' + b'
     # W' = y * W / a, b' = b - (y * u) / a
 
@@ -50,23 +50,24 @@ class RepVGGBlock(nn.Module):
         # return self.relu(self.bn(self.conv3x3(x) + self.conv1x1(x) + (self.identity(x) if self.identity else 0)))
         # Ablation experiment 2 : Post-addition BN
 
+    @torch.no_grad()
     def fused_block_to_conv(self):
         # ---------- Ablation experiment 2: Post-addition BN ----------
-        #         weight = self.conv3x3[0].weight
-        #         weight += F.pad(self.conv1x1[0].weight, [1, 1, 1, 1])
-        #         identify_conv = nn.Conv2d(
-        #             self.conv3x3[0].in_channels, self.conv3x3[0].in_channels,
-        #             kernel_size=3, bias=True, padding=1, groups=self.group
-        #         ).to(self.conv3x3[0].weight.device).requires_grad_(False)
-        #         identify_conv.weight.zero_()
-        #         input_dim = self.in_channels // self.group
-        #         for i in range(identify_conv.in_channels):
-        #             identify_conv.weight[i, i % input_dim, 1, 1] = 1
-        #         weight += identify_conv.weight
-        #         u = self.bn.running_mean
-        #         a = (self.bn.running_var + self.bn.eps).sqrt()
-        #         y, b = self.bn.weight, self.bn.bias
-        #         return {"weight": (y / a).reshape(-1, 1, 1, 1) * conv.weight, "bias": b - u * y / a}
+        # weight = self.conv3x3[0].weight
+        # weight += F.pad(self.conv1x1[0].weight, [1, 1, 1, 1])
+        # identify_conv = nn.Conv2d(
+        #     self.conv3x3[0].in_channels, self.conv3x3[0].out_channels,
+        #     kernel_size=3, bias=True, padding=1, groups=self.group
+        # ).to(self.conv3x3[0].weight.device).requires_grad_(False)
+        # identify_conv.weight.zero_()
+        # input_dim = self.in_channels // self.group
+        # for i in range(identify_conv.in_channels):
+        #     identify_conv.weight[i, i % input_dim, 1, 1] = 1
+        # weight += identify_conv.weight
+        # u = self.bn.running_mean
+        # a = (self.bn.running_var + self.bn.eps).sqrt()
+        # y, b = self.bn.weight, self.bn.bias
+        # return {"weight": (y / a).reshape(-1, 1, 1, 1) * weight, "bias": b - u * y / a}
         # ---------- Ablation experiment 2: Post-addition BN ----------
 
         conv_3x3_weight = add_bn_to_conv(conv=self.conv3x3[0], bn=self.conv3x3[1])

@@ -55,6 +55,7 @@ class RepVGGBlock(nn.Module):
             sum_3x3 += conv(x)
         return self.relu(sum_3x3 + self.conv1x1(x) + (self.identity(x) if self.identity else 0))
 
+    @torch.no_grad()
     def fused_block_to_conv(self):
         conv_3x3_weight = add_bn_to_conv(conv=self.conv3x3[0], bn=self.conv3x3[1])
         for conv_layer in self.add_conv:
@@ -126,7 +127,7 @@ class RepVGGplus(nn.Module):
     def mask_out(self, in_channels, out_channels):
         stage = nn.Sequential()
         stage.add_module("conv", nn.Conv2d(
-            in_channels=in_channels, out_channels=out_channels, kernel_size=3, stride=1, padding=2
+            in_channels=in_channels, out_channels=out_channels, kernel_size=3, stride=1, padding=1
         ))
         stage.add_module("avg_poll", nn.AdaptiveAvgPool2d(output_size=1))
         stage.add_module("flatten", nn.Flatten())
